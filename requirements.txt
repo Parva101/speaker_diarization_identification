@@ -1,0 +1,8 @@
+requests
+streamlit
+pandas
+pydub
+audio_recorder_streamlit
+speechbrain
+python-dotenv
+assemblyai
