@@ -6,7 +6,7 @@ import pandas as pd
 import io
 from pydub import AudioSegment
 from audio_recorder_streamlit import audio_recorder
-from updated_final import (
+from utils import (
     validate_audio_file,
     speechbrain_model,
     get_audio_segments,
