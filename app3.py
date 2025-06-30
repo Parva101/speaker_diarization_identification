@@ -5,18 +5,15 @@ import time
 import pandas as pd
 import io
 from pydub import AudioSegment
-
-
-
 from audio_recorder_streamlit import audio_recorder
 from updated_final import (
     validate_audio_file,
-    assembly_ai,
     speechbrain_model,
     get_audio_segments,
     export_audio_files,
     speaker_identification,
-    save_to_csv
+    save_to_csv,
+    assembly_ai
 )
 
 # Streamlit app configuration
@@ -46,6 +43,8 @@ def audio_input(label, key):
             type=["wav"],
             key=f"upload_{key}"
         )
+        if audio_file:
+            return audio_file.getvalue(), audio_file.name
     
     with tab2:
         audio_bytes = audio_recorder(
@@ -76,28 +75,26 @@ def main():
     2. **Transcribe Speech**  
     3. **Diarize Speakers**—split the conversation into speaker turns  
     4. **Identify Speakers** by clustering voice prints or reference samples  
-    5. **Export Clips & Transcripts** per speaker for downstream analysis  
+    5. **Export Clips & Transcripts** per speaker for downstream analysis  """)
+    st.sidebar.header("Settings")
+    speakers_expected = st.sidebar.slider("Expected Number of Speakers", 1, 6, 2)
 
-    """)
-
-    # Sidebar configuration
-    with st.sidebar:
-        st.header("Settings")
-        speakers_expected = st.number_input(
-            "Expected Number of Speakers",
-            min_value=1,
-            max_value=6,
-            value=2,
-            help="Estimated different voices in the conversation"
-        )
+    #get user's deepgram api key
+    api_key=st.sidebar.text_input("AssemblyAI API Key",type="password" )
 
     # Audio input sections
     conv_file, conv_recording = audio_input("Conversation Audio", "conv")
-    ref_file, ref_recording = audio_input("Reference Voice", "ref")
+    st.subheader("Reference Audios & Names")
+    ref_files = st.file_uploader("Upload reference audio files (WAV)" \
+    "**You can upload multiple reference files as well", type=["wav"], accept_multiple_files=True)
+    reference_info = []
+    for ref in ref_files:
+        ref_name = st.text_input(f"Name for {ref.name}", key=ref.name)
+        if ref_name:
+            reference_info.append((ref_name, ref.getvalue(), ref.name))
 
     if st.button("Analyze Conversation", type="primary"):
         # Process audio inputs
-        temp_files = []
         try:
             # Handle conversation audio
             if conv_file:
@@ -109,24 +106,19 @@ def main():
                 return
 
             # Handle reference audio
-            if ref_file:
-                ref_path = save_audio_file(ref_file.getvalue())
-            elif ref_recording:
-                ref_path = save_audio_file(ref_recording)
-            else:
-                st.error("Missing reference doctor voice input")
-                return
-
-            temp_files.extend([conv_path, ref_path])
+            reference_paths = {}
+            for name, data, fname in reference_info:
+                path = save_audio_file(data, suffix=os.path.splitext(fname)[1])
+                if path and validate_audio_file(path):
+                    reference_paths[name] = path
 
             with st.spinner("Analyzing audio..."):
                 # Validate files
                 validate_audio_file(conv_path)
-                validate_audio_file(ref_path)
 
                 # Transcription pipeline
                 start_time = time.time()
-                transcript = assembly_ai(speakers_expected, conv_path)
+                transcript = assembly_ai(speakers_expected,conv_path,api_key)
                 st.info(f"Transcription completed in {time.time()-start_time:.1f}s")
 
                 # Audio processing
@@ -140,7 +132,7 @@ def main():
                 # Speaker identification
                 model = speechbrain_model()
                 df_identified = speaker_identification(
-                    model, output_files, ref_path, df
+                    model, output_files, reference_paths, df
                 )
 
                 # Display results
@@ -165,7 +157,7 @@ def main():
         
         finally:
             # Cleanup temporary files
-            for f in temp_files:
+            for f in [conv_path] + list(reference_paths.values()) + list(output_files.values()):
                 if f and os.path.exists(f):
                     os.remove(f)
 
