@@ -20,7 +20,7 @@ from utils import (
 st.set_page_config(page_title="Speaker Diarization & Identification")
 
 def save_audio_file(audio_bytes, suffix=".wav"):
-    """Save audio bytes to a temporary file"""
+    """Save raw audio bytes to a temporary WAV file and return its path."""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
             tmp_file.write(audio_bytes)
@@ -29,25 +29,22 @@ def save_audio_file(audio_bytes, suffix=".wav"):
         st.error(f"Error saving audio file: {str(e)}")
         return None
 
-def audio_input(label, key):
-    """Audio input component with manual stop control"""
+def audio_input(label: str, key: str) -> tuple[bytes, str]:
+    """Presents upload and recording tabs. Returns (audio_bytes, filename)."""
     st.subheader(label)
-    tab1, tab2 = st.tabs(["Upload", "Record"])
-    
-    audio_file = None
-    audio_bytes = None
-    
-    with tab1:
-        audio_file = st.file_uploader(
+    tab_up, tab_rec = st.tabs(["Upload", "Record"])
+        
+    with tab_up:
+        uploader = st.file_uploader(
             f"Upload {label} (WAV)",
             type=["wav"],
             key=f"upload_{key}"
         )
-        if audio_file:
-            return audio_file.getvalue(), audio_file.name
+        if uploader:
+            return uploader.getvalue(), uploader.name
     
-    with tab2:
-        audio_bytes = audio_recorder(
+    with tab_rec:
+        recorded = audio_recorder(
             text="Click to start/stop recording",
             recording_color="#e8b62c",
             neutral_color="#6aa36f",
@@ -57,13 +54,14 @@ def audio_input(label, key):
             energy_threshold=(-1.0, 1.0),
             key=f"manual_recorder_{key}"
         )
-        if audio_bytes:
-            st.audio(audio_bytes, format="audio/wav")
+        if recorded:
+            st.audio(recorded, format="audio/wav")
             # Load into pydub and read length in ms
-            audio_seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format="wav")
+            audio_seg = AudioSegment.from_file(io.BytesIO(recorded), format="wav")
             duration_seconds = len(audio_seg) / 1000.0
-            st.caption(f"Recorded duration: {duration_seconds:.2f} s")    
-    return audio_file, audio_bytes
+            st.caption(f"Recorded duration: {duration_seconds:.2f} s")  
+            return recorded, f"recorded_{key}.wav"  
+    return None,None
 
 def main():
     st.title("Speaker Diarization & Identification")
@@ -83,73 +81,85 @@ def main():
     api_key=st.sidebar.text_input("AssemblyAI API Key",type="password" )
 
     # Audio input sections
-    conv_file, conv_recording = audio_input("Conversation Audio", "conv")
+    conv_bytes, conv_name = audio_input("Conversation Audio", "conv")
     st.subheader("Reference Audios & Names")
-    ref_files = st.file_uploader("Upload reference audio files (WAV)" \
+
+    ref_files = st.file_uploader("Upload reference audio files (WAV) (Optional)" \
     "**You can upload multiple reference files as well", type=["wav"], accept_multiple_files=True)
-    reference_info = []
-    for ref in ref_files:
-        ref_name = st.text_input(f"Name for {ref.name}", key=ref.name)
-        if ref_name:
-            reference_info.append((ref_name, ref.getvalue(), ref.name))
+    references = {}
+    for file in ref_files:
+        name = st.text_input(f"Name for {file.name}", key=file.name)
+        if name:
+            references[name] = file
 
     if st.button("Analyze Conversation", type="primary"):
         # Process audio inputs
         try:
             # Handle conversation audio
-            if conv_file:
-                conv_path = save_audio_file(conv_file.getvalue())
-            elif conv_recording:
-                conv_path = save_audio_file(conv_recording)
-            else:
-                st.error("Missing conversation audio input")
+            if not conv_bytes or not api_key:
+                st.error("Provide conversation audio")
+                return
+            if not api_key:
+                st.error("Provide your AssemblyAI API key.")
+                return
+            conv_path = save_audio_file(conv_bytes, suffix=os.path.splitext(conv_name)[1])
+            if not conv_path:
                 return
 
+            try:
+                validate_audio_file(conv_path)
+            except Exception as e:
+                st.error(str(e))
+                return
+            
             # Handle reference audio
-            reference_paths = {}
-            for name, data, fname in reference_info:
-                path = save_audio_file(data, suffix=os.path.splitext(fname)[1])
-                if path and validate_audio_file(path):
-                    reference_paths[name] = path
+            for file in ref_files:
+                # get value and filename
+                val = file.getvalue()
+                path = save_audio_file(val, suffix=os.path.splitext(file.name)[1])
+                try:
+                    validate_audio_file(path)
+                    # find matching key by filename
+                    for label in list(references):
+                        if file.name in label or references[label] is None:
+                            references[label] = path
+                            break
+                except Exception:
+                    if path and os.path.exists(path):
+                        os.remove(path)
 
             with st.spinner("Analyzing audio..."):
-                # Validate files
-                validate_audio_file(conv_path)
-
                 # Transcription pipeline
                 start_time = time.time()
                 transcript = assembly_ai(speakers_expected,conv_path,api_key)
-                st.info(f"Transcription completed in {time.time()-start_time:.1f}s")
+                st.success(f"Transcription completed in {time.time()-start_time:.1f}s")
 
                 # Audio processing
-                combined_audio, transcript_data = get_audio_segments(conv_path, transcript)
-                output_files = export_audio_files(combined_audio)
+            combined_audio, transcript_data = get_audio_segments(conv_path, transcript)
+            os.remove(conv_path)
+            output_files = export_audio_files(combined_audio)
 
-                # Create transcript dataframe
-                df = pd.DataFrame(transcript_data,
-                                columns=["Speaker", "Start Time", "End Time", "Text"])
+            # Create transcript dataframe
+            df = pd.DataFrame(transcript_data,
+                            columns=["speaker","start","end","text"])
 
-                # Speaker identification
-                model = speechbrain_model()
-                df_identified = speaker_identification(
-                    model, output_files, reference_paths, df
-                )
+            # Speaker identification
+            model = speechbrain_model()
+            df_identified = speaker_identification(
+                model, output_files, references, df
+            )
 
-                # Display results
-                st.success("Analysis Complete!")
-                st.dataframe(df_identified.style.set_properties(**{
-                    'text-align': 'left',
-                    'white-space': 'pre-wrap'
-                }))
+            # Display results
+            st.dataframe(df_identified)
 
-                # Download options
-                csv = df_identified.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="Download Transcript",
-                    data=csv,
-                    file_name="transcript.csv",
-                    mime="text/csv"
-                )
+            # Download options
+            csv = df_identified.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="Download Transcript",
+                data=csv,
+                file_name="transcript.csv",
+                mime="text/csv"
+            )
 
         except Exception as e:
             st.error(f"Error processing audio: {str(e)}")
@@ -157,9 +167,15 @@ def main():
         
         finally:
             # Cleanup temporary files
-            for f in [conv_path] + list(reference_paths.values()) + list(output_files.values()):
-                if f and os.path.exists(f):
-                    os.remove(f)
+            cleanup_paths = list(references.values())
+            if output_files is not None:
+                if isinstance(output_files, dict):
+                    cleanup_paths += list(output_files.values())
+                else:
+                    cleanup_paths += output_files
+            for path in cleanup_paths:
+                if isinstance(path, str) and os.path.exists(path):
+                    os.remove(path)
 
 if __name__ == "__main__":
     main()

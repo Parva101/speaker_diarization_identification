@@ -6,3 +6,6 @@ audio_recorder_streamlit
 speechbrain
 python-dotenv
 assemblyai
+torch 
+torchaudio
+soundfile
