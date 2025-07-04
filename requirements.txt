@@ -10,3 +10,6 @@ torch==2.7.1
 torchaudio==2.7.1
 soundfile==0.13.1
 pydantic_settings-2.10.1
+numpy==2.2.6
+sentencepiece==0.2.0
+
