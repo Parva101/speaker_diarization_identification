@@ -1,181 +1,94 @@
+from __future__ import annotations
+import asyncio, io, logging, pandas as pd
 import streamlit as st
-import tempfile
-import os
-import time
-import pandas as pd
-import io
 from pydub import AudioSegment
 from audio_recorder_streamlit import audio_recorder
-from utils import (
-    validate_audio_file,
-    speechbrain_model,
-    get_audio_segments,
-    export_audio_files,
-    speaker_identification,
-    save_to_csv,
-    assembly_ai
-)
+from typing import Dict
+import shutil, os, tempfile, pathlib
+import utils as svc
 
-# Streamlit app configuration
+logger = logging.getLogger(__name__)
 st.set_page_config(page_title="Speaker Diarization & Identification")
 
-def save_audio_file(audio_bytes, suffix=".wav"):
-    """Save raw audio bytes to a temporary WAV file and return its path."""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-            tmp_file.write(audio_bytes)
-            return tmp_file.name
-    except Exception as e:
-        st.error(f"Error saving audio file: {str(e)}")
-        return None
-
-def audio_input(label: str, key: str) -> tuple[bytes, str]:
-    """Presents upload and recording tabs. Returns (audio_bytes, filename)."""
+# ─── UI helper ─────────────────────────────────────────────────────────────
+def audio_input(label: str, key: str):
     st.subheader(label)
-    tab_up, tab_rec = st.tabs(["Upload", "Record"])
-        
-    with tab_up:
-        uploader = st.file_uploader(
-            f"Upload {label} (WAV)",
-            type=["wav"],
-            key=f"upload_{key}"
-        )
-        if uploader:
-            return uploader.getvalue(), uploader.name
-    
-    with tab_rec:
-        recorded = audio_recorder(
-            text="Click to start/stop recording",
-            recording_color="#e8b62c",
-            neutral_color="#6aa36f",
-            icon_name="microphone",
-            icon_size="2x",
-            pause_threshold=300,  # 5 minutes threshold
-            energy_threshold=(-1.0, 1.0),
-            key=f"manual_recorder_{key}"
-        )
-        if recorded:
-            st.audio(recorded, format="audio/wav")
-            # Load into pydub and read length in ms
-            audio_seg = AudioSegment.from_file(io.BytesIO(recorded), format="wav")
-            duration_seconds = len(audio_seg) / 1000.0
-            st.caption(f"Recorded duration: {duration_seconds:.2f} s")  
-            return recorded, f"recorded_{key}.wav"  
-    return None,None
+    upload_tab, record_tab = st.tabs(["Upload", "Record"])
 
+    with upload_tab:
+        fu = st.file_uploader(f"Upload {label} (WAV)", ["wav"], key=f"up_{key}")
+        if fu:
+            return fu.getvalue(), fu.name
+
+    with record_tab:
+        raw = audio_recorder(key=f"rec_{key}")
+        if raw:
+            st.audio(raw, format="audio/wav")
+            dur = len(AudioSegment.from_file(io.BytesIO(raw), format="wav")) / 1000
+            st.caption(f"Duration: {dur:.1f}s")
+            return raw, f"recorded_{key}.wav"
+
+    return None, None
+
+# ─── MAIN ──────────────────────────────────────────────────────────────────
 def main():
     st.title("Speaker Diarization & Identification")
-    st.markdown("""
-    **Speaker Diarization & Identification** is a Streamlit app that processes
-    audio recordings to:
 
-    1. **Load or Record WAV Audio** directly in the browser  
-    2. **Transcribe Speech**  
-    3. **Diarize Speakers**—split the conversation into speaker turns  
-    4. **Identify Speakers** by clustering voice prints or reference samples  
-    5. **Export Clips & Transcripts** per speaker for downstream analysis  """)
-    st.sidebar.header("Settings")
-    speakers_expected = st.sidebar.slider("Expected Number of Speakers", 1, 6, 2)
+    # Sidebar inputs
+    api_key = st.sidebar.text_input("AssemblyAI API Key", type="password")
+    speakers_expected = st.sidebar.slider("Expected speakers", 1, 6, 2)
+    threshold = st.sidebar.slider("Similarity threshold", 0.1, 1.0, 0.75, 0.05)
 
-    #get user's deepgram api key
-    api_key=st.sidebar.text_input("AssemblyAI API Key",type="password" )
+    conv_bytes, conv_name = audio_input("Conversation", "conv")
 
-    # Audio input sections
-    conv_bytes, conv_name = audio_input("Conversation Audio", "conv")
-    st.subheader("Reference Audios & Names")
+    st.subheader("Reference Speakers (Optional)")
+    ref_files = st.file_uploader("Upload reference WAVs", ["wav"], accept_multiple_files=True)
+    references: Dict[str, str | None] = {
+        st.text_input(f"Label for {f.name}", key=f.name): None for f in ref_files or []
+    }
 
-    ref_files = st.file_uploader("Upload reference audio files (WAV) (Optional)" \
-    "**You can upload multiple reference files as well", type=["wav"], accept_multiple_files=True)
-    references = {}
-    for file in ref_files:
-        name = st.text_input(f"Name for {file.name}", key=file.name)
-        if name:
-            references[name] = file
-
-    if st.button("Analyze Conversation", type="primary"):
-        # Process audio inputs
-        try:
-            # Handle conversation audio
-            if not conv_bytes or not api_key:
-                st.error("Provide conversation audio")
-                return
-            if not api_key:
-                st.error("Provide your AssemblyAI API key.")
-                return
-            conv_path = save_audio_file(conv_bytes, suffix=os.path.splitext(conv_name)[1])
-            if not conv_path:
-                return
-
-            try:
-                validate_audio_file(conv_path)
-            except Exception as e:
-                st.error(str(e))
-                return
-            
-            # Handle reference audio
-            for file in ref_files:
-                # get value and filename
-                val = file.getvalue()
-                path = save_audio_file(val, suffix=os.path.splitext(file.name)[1])
-                try:
-                    validate_audio_file(path)
-                    # find matching key by filename
-                    for label in list(references):
-                        if file.name in label or references[label] is None:
-                            references[label] = path
-                            break
-                except Exception:
-                    if path and os.path.exists(path):
-                        os.remove(path)
-
-            with st.spinner("Analyzing audio..."):
-                # Transcription pipeline
-                start_time = time.time()
-                transcript = assembly_ai(speakers_expected,conv_path,api_key)
-                st.success(f"Transcription completed in {time.time()-start_time:.1f}s")
-
-                # Audio processing
-            combined_audio, transcript_data = get_audio_segments(conv_path, transcript)
-            os.remove(conv_path)
-            output_files = export_audio_files(combined_audio)
-
-            # Create transcript dataframe
-            df = pd.DataFrame(transcript_data,
-                            columns=["speaker","start","end","text"])
-
-            # Speaker identification
-            model = speechbrain_model()
-            df_identified = speaker_identification(
-                model, output_files, references, df
-            )
-
-            # Display results
-            st.dataframe(df_identified)
-
-            # Download options
-            csv = df_identified.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="Download Transcript",
-                data=csv,
-                file_name="transcript.csv",
-                mime="text/csv"
-            )
-
-        except Exception as e:
-            st.error(f"Error processing audio: {str(e)}")
+    if st.button("Analyze"):
+        if not conv_bytes:
+            st.error("Conversation audio required")
             st.stop()
-        
-        finally:
-            # Cleanup temporary files
-            cleanup_paths = list(references.values())
-            if output_files is not None:
-                if isinstance(output_files, dict):
-                    cleanup_paths += list(output_files.values())
-                else:
-                    cleanup_paths += output_files
-            for path in cleanup_paths:
-                if isinstance(path, str) and os.path.exists(path):
-                    os.remove(path)
+        if not api_key:
+            st.error("AssemblyAI key required")
+            st.stop()
+
+        # ── Transcription ────────────────────────────────────────────────
+        with st.spinner("Transcribing…"):
+            with svc.temp_wav(conv_bytes) as conv_path:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                transcript = loop.run_until_complete(
+                    svc.transcribe(conv_path, speakers_expected, api_key)
+                )
+                segs, rows = svc.segment_by_speaker(conv_path, transcript)
+                clip_paths, clip_dir = svc.export_segments(segs)
+
+        # ── Prepare reference temp files ─────────────────────────────────
+        ref_dir = pathlib.Path(tempfile.mkdtemp(prefix="refs_"))
+        for f in ref_files or []:
+            path = ref_dir / f.name
+            path.write_bytes(f.getvalue())
+            for lbl in references:
+                if references[lbl] is None:
+                    references[lbl] = str(path)
+                    break
+
+        # ── Identification & display ────────────────────────────────────
+        model = svc.get_model()
+        df = pd.DataFrame(rows, columns=["speaker", "start", "end", "text"])
+        df = svc.identify(model, clip_paths, references, df, threshold)
+
+        st.dataframe(df)
+        st.download_button("Download CSV", df.to_csv(index=False).encode(), "transcript.csv", "text/csv")
+
+        if clip_dir.exists():
+            shutil.rmtree(clip_dir, ignore_errors=True)
+        if ref_dir.exists():
+            shutil.rmtree(ref_dir, ignore_errors=True)
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     main()
