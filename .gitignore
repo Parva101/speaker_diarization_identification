@@ -2,3 +2,5 @@
 a.py
 test.ipynb
 __pycache__/
+.cache
+.gitignore
